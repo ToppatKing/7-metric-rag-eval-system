@@ -160,14 +160,6 @@ Create a `.env` file in the root directory:
 ```env
 OPENAI_API_KEY=sk-proj-your-actual-api-key-here
 ```
-Install `tqdm` to generate a progress bar.
-
-This ensures that, when handling large datasets (like CUAD), you are not staring at a blank terminal for an hour with no knowledge about a potential crash:
-
-```bash
-pip install tqdm
-```
-Note: The potentially slow speeds are also due to a self-imposed `timer.sleep` delay in `src/indexer.py`, originally set at 1 second, to avoid Rate Limit Error 429 when operating with lower-tier subscription models.
 
 ### 3. Interactive Execution
 Run the interactive pipeline:
