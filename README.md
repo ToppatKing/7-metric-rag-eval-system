@@ -153,6 +153,7 @@ python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
+```
 
 Create a `.env` file in the root directory:
 
@@ -161,6 +162,7 @@ OPENAI_API_KEY=sk-proj-your-actual-api-key-here
 
 ### 3. Interactive Execution
 Run the interactive pipeline:
+```
 
 ```bash
 python main.py
@@ -170,6 +172,7 @@ Follow the CLI prompts:
 1. **Document Folder Path:** Enter the local folder containing your domain `.pdf` or `.txt` files (e.g., `./data` or `/Users/name/Documents/Papers`).
 2. **User Question:** Enter your specific domain question.
 3. **Ground Truth Answer:** Enter the gold-standard reference answer used to compute Context Recall and ROUGE-L.
+```
 
 ## Interpreting Execution Results
 
@@ -191,6 +194,7 @@ Upon completing the simulations, the pipeline prints a detailed comparison table
 | Latency (s)       |  1.2104 |  1.3852 |  2.7410 |
 | Token Efficiency  |  0.0652 |  0.0712 |  0.0894 |
 ============================================================
+```
 
 ### Analytical Insights from Example Output:
 
