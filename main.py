@@ -6,11 +6,9 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any
 
-from dotenv import load_dotenv
-
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings, ChatOpenAI, OpenAIEmbeddings
-from langchain_core.runnables import RunnableLambda
 
+from src.config import RAGConfig
 from src.indexer import Indexer, get_corpus_files
 from src.evaluator import Evaluator
 from src.generator import RAGGenerator
@@ -23,60 +21,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RAGEvaluatorMain")
 
-load_dotenv()
+class StrategyRetrieverWrapper:
+    """Adapts RetrievalEngine to LangChain's .invoke() interface for the generator."""
+    def __init__(self, engine: RetrievalEngine, strategy_name: str):
+        self.engine = engine
+        self.strategy_name = strategy_name
 
+    def invoke(self, query: str):
+        return self.engine.retrieve(query, strategy=self.strategy_name)
 
-def initialize_models():
-    """Initialize LLM and Embedding instances."""
-    azure_key = os.getenv("AZURE_OPENAI_API_KEY")
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-    
-    chat_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o-mini")
-    embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
-
-    if azure_key and azure_endpoint:
+def initialize_models(config: RAGConfig):
+    """Initialize LLM and Embedding instances using RAGConfig."""
+    if config.azure_api_key and config.azure_endpoint:
         logger.info("Initializing Azure OpenAI models...")
         llm = AzureChatOpenAI(
-            azure_deployment=chat_deployment,
-            api_version=azure_api_version,
+            azure_deployment=config.llm_model,
+            api_version=config.azure_api_version,
             temperature=0.0,
         )
         embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=embedding_deployment,
-            api_version=azure_api_version,
+            azure_deployment=config.embedding_model,
+            api_version=config.azure_api_version,
         )
-        model_name = f"azure:{chat_deployment}"
-        embedding_name = f"azure:{embedding_deployment}"
-    elif os.getenv("OPENAI_API_KEY"):
+        return llm, embeddings, f"azure:{config.llm_model}", f"azure:{config.embedding_model}"
+    elif config.openai_api_key:
         logger.info("Initializing standard OpenAI models...")
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        model_name = "openai:gpt-4o-mini"
-        embedding_name = "openai:text-embedding-3-small"
+        return llm, embeddings, "openai:gpt-4o-mini", "openai:text-embedding-3-small"
     else:
-        logger.error("No valid API credentials found in environment variables (.env).")
+        logger.error("No valid API credentials found.")
         sys.exit(1)
 
-    return llm, embeddings, model_name, embedding_name
-
-
-def parse_args():
+def parse_args(config: RAGConfig):
     parser = argparse.ArgumentParser(description="7-Metric RAG Evaluation System")
     parser.add_argument("--corpus_dir", type=str, default="data", help="Directory containing source documents.")
     parser.add_argument("--persist_dir", type=str, default="chroma_db", help="Directory for vector DB storage.")
     parser.add_argument("--results_dir", type=str, default="results", help="Directory for evaluation outputs.")
     parser.add_argument("--run_name", type=str, default="cuad_benchmark", help="Prefix label for this run.")
-    parser.add_argument("--num_trials", type=int, default=3, help="Number of repeated trials per strategy.")
     parser.add_argument("--force_reindex", action="store_true", help="Force rebuild of the vector database.")
-    parser.add_argument("--chunk_size", type=int, default=1000, help="Document chunk size.")
-    parser.add_argument("--chunk_overlap", type=int, default=200, help="Document chunk overlap.")
-    parser.add_argument("--top_k", type=int, default=4, help="Number of chunks to retrieve per query.")
-    return parser.parse_args()
-
+    
+    args = parser.parse_args()
+    return args
 
 def main():
-    args = parse_args()
+    config = RAGConfig()
+    args = parse_args(config)
+    
     logger.info("Starting RAG System Evaluation with Phase 4 Statistical Controls...")
 
     corpus_path = Path(args.corpus_dir)
@@ -86,15 +77,14 @@ def main():
         logger.error(f"No valid corpus documents found in '{corpus_path}'. Aborting.")
         sys.exit(1)
 
-    llm, embeddings, model_name, embedding_name = initialize_models()
+    llm, embeddings, model_name, embedding_name = initialize_models(config)
 
-    # Indexing Phase
     indexer = Indexer(
         persist_directory=args.persist_dir,
         embedding_function=embeddings,
         embedding_model_name=embedding_name,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
     )
 
     vectorstore = indexer.build_or_load_index(
@@ -113,13 +103,13 @@ def main():
         ["Yes, Section 4 contains an exclusive distribution rights clause."]
     ]
 
-    # SOLUTION 1: Initialize RetrievalEngine and map strategies using RunnableLambda
-    engine = RetrievalEngine(vectorstore=vectorstore, llm=llm, top_k=args.top_k)
-    
+    # Initialize the custom RetrievalEngine
+    retrieval_engine = RetrievalEngine(vectorstore=vectorstore, llm=llm, top_k=config.top_k)
+
     strategies = {
-        "Dense_Similarity": RunnableLambda(engine.retrieve_dense),
-        "MMR_Search": RunnableLambda(engine.retrieve_mmr),
-        "HyDE_Search": RunnableLambda(engine.retrieve_hyde),
+        "Dense_Similarity": StrategyRetrieverWrapper(retrieval_engine, "dense"),
+        "MMR_Search": StrategyRetrieverWrapper(retrieval_engine, "mmr"),
+        "HyDE_Search": StrategyRetrieverWrapper(retrieval_engine, "hyde"),
     }
 
     generator = RAGGenerator(llm=llm, model_name=model_name)
@@ -127,8 +117,8 @@ def main():
 
     strategy_trial_outputs: Dict[str, List[List[Dict[str, Any]]]] = {s: [] for s in strategies}
 
-    for trial_idx in range(args.num_trials):
-        logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{args.num_trials} ===")
+    for trial_idx in range(config.num_trials):
+        logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{config.num_trials} ===")
         
         strategy_items = list(strategies.items())
         random.shuffle(strategy_items)
@@ -154,10 +144,10 @@ def main():
     config_manifest = {
         "llm_model": model_name,
         "embedding_model": embedding_name,
-        "chunk_size": args.chunk_size,
-        "chunk_overlap": args.chunk_overlap,
-        "top_k": args.top_k,
-        "num_trials": args.num_trials,
+        "chunk_size": config.chunk_size,
+        "chunk_overlap": config.chunk_overlap,
+        "top_k": config.top_k,
+        "num_trials": config.num_trials,
         "total_documents": len(discovered_files),
     }
 
@@ -167,8 +157,7 @@ def main():
         strategy_results=final_strategy_results
     )
 
-    logger.info(f"Phase 4 Benchmark successfully completed. Results stored in: {output_path}")
-
+    logger.info(f"Benchmark successfully completed. Results stored in: {output_path}")
 
 if __name__ == "__main__":
     main()
