@@ -55,6 +55,7 @@ graph TD
     M[Ground Truth] -.-> L
     L --> N[7-Metric Output DataFrame]
     class L,M,N evaluation;
+```
 
 # Technical Documentation & Evaluation Guide
 
