@@ -1,8 +1,11 @@
 import os
+import time
 import hashlib
 import logging
+from pathlib import Path
 from typing import List
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, DirectoryLoader
+from tqdm import tqdm
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -16,7 +19,9 @@ class DocumentIndexer:
         self.config = config
         self.embeddings = OpenAIEmbeddings(
             api_key=config.openai_api_key, 
-            model=config.embedding_model
+            model=config.embedding_model,
+            # Built-in retry logic for brief API hiccups
+            max_retries=3 
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=config.chunk_size,
@@ -24,43 +29,69 @@ class DocumentIndexer:
             length_function=len
         )
 
-    def load_documents(self, data_dir: str) -> List:
-        """Loads all PDF and TXT files from the user-specified directory."""
-        logger.info(f"Loading documents from: {data_dir}")
-        
-        pdf_loader = DirectoryLoader(data_dir, glob="**/*.pdf", loader_cls=PyPDFLoader)
-        txt_loader = DirectoryLoader(data_dir, glob="**/*.txt", loader_cls=TextLoader)
-        
-        docs = pdf_loader.load() + txt_loader.load()
-        logger.info(f"Successfully loaded {len(docs)} document chunks/pages.")
-        return docs
-
     def build_or_load_index(self, data_dir: str) -> Chroma:
-        """Builds or loads a vector store unique to the provided data_dir."""
-        # Create a unique database directory hash based on the folder path
+        """Builds or loads a vector store using chunk-batching for massive datasets."""
         folder_hash = hashlib.md5(os.path.abspath(data_dir).encode()).hexdigest()[:8]
         persist_dir = f"{self.config.chroma_persist_dir}_{folder_hash}"
         
-        # If an index already exists for this exact directory, load it
+        # 1. Initialize the Chroma vector store object
+        vectorstore = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=self.embeddings
+        )
+        
+        # 2. Check if the database already contains data
         if os.path.exists(persist_dir) and os.listdir(persist_dir):
-            print(f"📂 Found existing vector cache for '{data_dir}'. Loading...")
-            return Chroma(
-                persist_directory=persist_dir,
-                embedding_function=self.embeddings
-            )
+            # A simple check: if Chroma has documents, assume it's fully built
+            if vectorstore._collection.count() > 0:
+                print(f"📂 Found existing populated vector cache for '{data_dir}'. Loading...")
+                return vectorstore
             
-        print(f"⚙️ Building new vector store from '{data_dir}'...")
-        docs = self.load_documents(data_dir)
-        if not docs:
+        print(f"⚙️ Building new vector store from '{data_dir}' (Massive Dataset Mode)...")
+        
+        # 3. Gather all file paths (Lazy Loading setup)
+        pdf_files = list(Path(data_dir).rglob("*.pdf"))
+        txt_files = list(Path(data_dir).rglob("*.txt"))
+        all_files = pdf_files + txt_files
+        
+        if not all_files:
             raise ValueError(f"No PDF or TXT files found inside '{data_dir}'.")
             
-        chunks = self.text_splitter.split_documents(docs)
-        print(f"✂️ Split documents into {len(chunks)} contextual chunks.")
+        print(f"📄 Found {len(all_files)} files. Processing in batches to conserve RAM and API limits...")
+
+        # 4. Process files in smaller batches (e.g., 5 files at a time)
+        file_batch_size = 5
         
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=self.embeddings,
-            persist_directory=persist_dir
-        )
-        print(f"✅ Vector store successfully saved to '{persist_dir}'")
+        for i in tqdm(range(0, len(all_files), file_batch_size), desc="Processing File Batches"):
+            batch_files = all_files[i:i + file_batch_size]
+            batch_docs = []
+            
+            # Load only the current batch of files into RAM
+            for file_path in batch_files:
+                try:
+                    if file_path.suffix.lower() == '.pdf':
+                        batch_docs.extend(PyPDFLoader(str(file_path)).load())
+                    else:
+                        batch_docs.extend(TextLoader(str(file_path)).load())
+                except Exception as e:
+                    logger.warning(f"Failed to load {file_path}: {e}")
+                    
+            if not batch_docs:
+                continue
+                
+            # Split the current batch into chunks
+            chunks = self.text_splitter.split_documents(batch_docs)
+            
+            # 5. Push to OpenAI/Chroma in micro-batches to respect Embedding Rate Limits
+            chunk_batch_size = 100
+            for j in range(0, len(chunks), chunk_batch_size):
+                micro_batch = chunks[j:j + chunk_batch_size]
+                
+                # Add documents (this calls the embedding API)
+                vectorstore.add_documents(micro_batch)
+                
+                # Sleep for one second to avoid TPM/RPM rate limits (can be modified)
+                time.sleep(1) 
+                
+        print(f"✅ Vector store successfully built and saved to '{persist_dir}'")
         return vectorstore
