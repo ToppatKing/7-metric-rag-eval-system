@@ -9,10 +9,12 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings, ChatOpenAI, OpenAIEmbeddings
+from langchain_core.runnables import RunnableLambda
 
 from src.indexer import Indexer, get_corpus_files
 from src.evaluator import Evaluator
 from src.generator import RAGGenerator
+from src.retriever import RetrievalEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,13 +113,13 @@ def main():
         ["Yes, Section 4 contains an exclusive distribution rights clause."]
     ]
 
+    # SOLUTION 1: Initialize RetrievalEngine and map strategies using RunnableLambda
+    engine = RetrievalEngine(vectorstore=vectorstore, llm=llm, top_k=args.top_k)
+    
     strategies = {
-        "Dense_Similarity": vectorstore.as_retriever(
-            search_type="similarity", search_kwargs={"k": args.top_k}
-        ),
-        "MMR_Search": vectorstore.as_retriever(
-            search_type="mmr", search_kwargs={"k": args.top_k, "fetch_k": args.top_k * 3, "lambda_mult": 0.5}
-        ),
+        "Dense_Similarity": RunnableLambda(engine.retrieve_dense),
+        "MMR_Search": RunnableLambda(engine.retrieve_mmr),
+        "HyDE_Search": RunnableLambda(engine.retrieve_hyde),
     }
 
     generator = RAGGenerator(llm=llm, model_name=model_name)
@@ -125,7 +127,6 @@ def main():
 
     strategy_trial_outputs: Dict[str, List[List[Dict[str, Any]]]] = {s: [] for s in strategies}
 
-    # P2 Fix: Execute N trials with randomized execution order to eliminate API warm-up bias
     for trial_idx in range(args.num_trials):
         logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{args.num_trials} ===")
         
@@ -140,7 +141,6 @@ def main():
             
             strategy_trial_outputs[strategy_name].append(single_trial_run)
 
-    # Evaluate strategies using statistical controls
     final_strategy_results = []
     for strategy_name in strategies:
         trial_data = strategy_trial_outputs[strategy_name]
@@ -151,7 +151,6 @@ def main():
         )
         final_strategy_results.append(eval_summary)
 
-    # Write auditable artifacts
     config_manifest = {
         "llm_model": model_name,
         "embedding_model": embedding_name,
