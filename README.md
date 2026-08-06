@@ -52,7 +52,7 @@ graph TD
     I -.-> L((Evaluation Engine))
     K -.-> L
     D -.-> L
-    M[Ground Truth] -.-> L
+    M[Ground Truth (Optional)] -.-> L
     L --> N[7-Metric Output DataFrame]
     class L,M,N evaluation;
 ```
@@ -172,7 +172,13 @@ Follow the CLI prompts:
 
 1. **Document Folder Path:** Enter the local folder containing your domain `.pdf` or `.txt` files (e.g., `./data` or `/Users/name/Documents/Papers`).
 2. **User Question:** Enter your specific domain question.
-3. **Ground Truth Answer:** Enter the gold-standard reference answer used to compute Context Recall and ROUGE-L.
+3. **Ground Truth Answer:** Enter the gold-standard reference answer used to compute Context Recall and ROUGE-L. This is optional.
+
+## A Note on Reference-Free Evaluation Mode
+
+While a gold-standard Ground Truth answer is recommended for full-spectrum benchmarking (enabling Context Recall, Context Precision, and ROUGE-L), this system fully supports reference-free evaluation.
+
+If the ground-truth prompt is left blank during execution, the framework gracefully drops reference-dependent metrics and relies exclusively on self-consistency and semantic evaluation streams (Faithfulness, Answer Relevancy, Latency, and Token Efficiency). This makes the tool practical for rapid exploration of raw documentation where pre-annotated reference answers do not yet exist.
 
 ## Interpreting Execution Results
 
