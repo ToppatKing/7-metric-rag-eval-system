@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
+import numpy as np
 import pandas as pd
 from datasets import Dataset
 from ragas import evaluate
@@ -22,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 class Evaluator:
     """
-    RAG Evaluator that explicitly accepts LLM/Embedding dependencies, 
-    safeguards against masked failures, and generates atomic, timestamped artifacts.
+    RAG Evaluator that supports multi-trial statistical controls, 
+    safeguards against masked failures, and generates timestamped artifacts.
     """
 
     def __init__(
@@ -32,7 +33,6 @@ class Evaluator:
         embeddings: Embeddings,
         output_dir: str | Path = "results",
     ):
-        # 1. P2 Fix: Explicitly inject evaluator dependencies
         self.llm = llm
         self.embeddings = embeddings
         self.output_dir = Path(output_dir)
@@ -45,119 +45,126 @@ class Evaluator:
         ]
 
     def _validate_scores(self, result_dict: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        P1 Fix: Validate that required scores are finite and not artificially zeroed by errors.
-        """
+        """Validate that required scores are finite and not zeroed by errors."""
         for metric in self.metrics:
             score = result_dict.get(metric.name)
-            
             if score is None:
-                return False, f"Metric '{metric.name}' is missing from the results."
-                
+                return False, f"Metric '{metric.name}' is missing."
             try:
-                # Catch NaN or Inf values disguised as floats
                 if not math.isfinite(float(score)):
-                    return False, f"Metric '{metric.name}' returned a non-finite score: {score}"
+                    return False, f"Metric '{metric.name}' returned non-finite score: {score}"
             except (ValueError, TypeError):
-                return False, f"Metric '{metric.name}' returned a non-numeric score: {score}"
-                
+                return False, f"Metric '{metric.name}' returned non-numeric score: {score}"
         return True, ""
 
-    def evaluate_strategy(
+    def evaluate_multi_trial_strategy(
         self,
         strategy_name: str,
-        questions: List[str],
-        answers: List[str],
-        contexts: List[List[str]],
+        trial_outputs: List[List[Dict[str, Any]]],
         ground_truths: List[List[str]],
-        retrieved_doc_ids: List[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Evaluates a single RAG strategy and captures complete diagnostics.
+        P2 Fix: Evaluates a strategy across N trials and calculates statistical metrics
+        (median, standard deviation, and p95 latency).
         """
-        logger.info(f"Evaluating strategy: {strategy_name}")
+        logger.info(f"Evaluating {len(trial_outputs)} trial(s) for strategy: {strategy_name}")
         
-        # Prepare HuggingFace dataset format required by Ragas 0.1.7
-        dataset_dict = {
-            "question": questions,
-            "answer": answers,
-            "contexts": contexts,
-            "ground_truths": ground_truths, 
-        }
-        dataset = Dataset.from_dict(dataset_dict)
-        
-        status = "SUCCESS"
-        error_message = None
-        metrics_scores = {}
-        detailed_rows = []
+        trial_score_lists: Dict[str, List[float]] = {m.name: [] for m in self.metrics}
+        trial_latencies: List[float] = []
+        trial_costs: List[float] = []
+        trial_compressions: List[float] = []
 
-        try:
-            # 2. P1 Fix: Set raise_exceptions=True so API/Judge failures are not masked as 0.0
-            result = evaluate(
-                dataset,
-                metrics=self.metrics,
-                llm=self.llm,
-                embeddings=self.embeddings,
-                raise_exceptions=True, 
-            )
-            
-            metrics_scores = dict(result)
-            
-            # 3. P1 Fix: Additional validation to catch any hidden NaNs
-            is_valid, validation_err = self._validate_scores(metrics_scores)
-            if not is_valid:
-                status = "FAILED"
-                error_message = validation_err
+        raw_trial_records = []
+        overall_status = "SUCCESS"
+        last_error = None
 
-        except Exception as e:
-            logger.error(f"Execution failure during evaluation of {strategy_name}: {e}")
-            # 4. P1 Fix: Mark the strategy as failed rather than faking a numeric score
-            status = "FAILED"
-            error_message = str(e)
-            metrics_scores = {metric.name: None for metric in self.metrics}
-        
-        # 5. P1 Fix: Assemble detailed per-question records for auditability
-        for idx in range(len(questions)):
-            row = {
-                "question": questions[idx],
-                "expected_answer": ground_truths[idx] if ground_truths else [],
-                "generated_answer": answers[idx],
-                "retrieved_contexts": contexts[idx],
-                "retrieved_doc_ids": retrieved_doc_ids[idx] if retrieved_doc_ids else [],
-            }
-            detailed_rows.append(row)
+        for trial_idx, single_trial_run in enumerate(trial_outputs):
+            questions = [item["question"] for item in single_trial_run]
+            answers = [item["answer"] for item in single_trial_run]
+            contexts = [item["contexts"] for item in single_trial_run]
             
+            # Aggregate token & timing stats for this trial
+            trial_total_latency = sum(item["metrics"]["total_latency_sec"] for item in single_trial_run)
+            trial_total_cost = sum(item["metrics"]["estimated_cost_usd"] for item in single_trial_run)
+            avg_compression = np.mean([item["metrics"]["context_to_answer_compression_ratio"] for item in single_trial_run])
+
+            trial_latencies.append(trial_total_latency)
+            trial_costs.append(trial_total_cost)
+            trial_compressions.append(avg_compression)
+
+            dataset = Dataset.from_dict({
+                "question": questions,
+                "answer": answers,
+                "contexts": contexts,
+                "ground_truths": ground_truths,
+            })
+
+            try:
+                result = evaluate(
+                    dataset,
+                    metrics=self.metrics,
+                    llm=self.llm,
+                    embeddings=self.embeddings,
+                    raise_exceptions=True,
+                )
+                scores = dict(result)
+                is_valid, err = self._validate_scores(scores)
+                
+                if is_valid:
+                    for m in self.metrics:
+                        trial_score_lists[m.name].append(float(scores[m.name]))
+                else:
+                    overall_status = "PARTIAL_FAILURE"
+                    last_error = err
+
+            except Exception as e:
+                logger.error(f"Trial {trial_idx + 1} failed for {strategy_name}: {e}")
+                overall_status = "PARTIAL_FAILURE"
+                last_error = str(e)
+
+            raw_trial_records.append({
+                "trial_index": trial_idx + 1,
+                "questions_detail": single_trial_run
+            })
+
+        # Calculate statistical dispersion across trials
+        stats_summary = {}
+        for metric_name, values in trial_score_lists.items():
+            if values:
+                stats_summary[f"{metric_name}_median"] = round(float(np.median(values)), 4)
+                stats_summary[f"{metric_name}_std"] = round(float(np.std(values)), 4)
+            else:
+                stats_summary[f"{metric_name}_median"] = None
+                stats_summary[f"{metric_name}_std"] = None
+
+        # Calculate timing/efficiency statistics
+        stats_summary["latency_p95_sec"] = round(float(np.percentile(trial_latencies, 95)), 4) if trial_latencies else None
+        stats_summary["latency_median_sec"] = round(float(np.median(trial_latencies)), 4) if trial_latencies else None
+        stats_summary["avg_compression_ratio"] = round(float(np.mean(trial_compressions)), 4) if trial_compressions else None
+        stats_summary["avg_cost_usd"] = round(float(np.mean(trial_costs)), 6) if trial_costs else None
+
         return {
             "strategy_name": strategy_name,
-            "status": status,
-            "error": error_message,
-            "scores": metrics_scores,
-            "details": detailed_rows,
+            "status": overall_status if trial_score_lists[self.metrics[0].name] else "FAILED",
+            "error": last_error,
+            "statistics": stats_summary,
+            "trials_raw": raw_trial_records,
         }
-        
+
     def write_artifacts(
         self,
         run_name: str,
         experiment_config: Dict[str, Any],
         strategy_results: List[Dict[str, Any]]
     ) -> Path:
-        """
-        P1 Fix: Writes timestamped, auditable, and immutable artifacts for the run.
-        """
+        """Writes timestamped, auditable, and immutable artifacts."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         run_identifier = f"{run_name}_{timestamp}"
         run_dir = self.output_dir / run_identifier
         
-        # 6. P1 Fix: Avoid silently overwriting prior experiments (exist_ok=False)
-        try:
-            run_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            logger.error(f"Collision: Artifact directory {run_dir} already exists.")
-            run_identifier = f"{run_identifier}_retry"
-            run_dir = self.output_dir / run_identifier
-            run_dir.mkdir(parents=True, exist_ok=False)
-        
-        # Store experiment manifest (provenance, fingerprints)
+        run_dir.mkdir(parents=True, exist_ok=False)
+
+        # Store experiment manifest
         manifest_path = run_dir / "run_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump({
@@ -165,8 +172,8 @@ class Evaluator:
                 "timestamp": timestamp,
                 "config": experiment_config,
             }, f, indent=2)
-            
-        # Store summary CSV for statistical comparison
+
+        # Store statistical summary CSV
         summary_rows = []
         for res in strategy_results:
             row = {
@@ -174,17 +181,17 @@ class Evaluator:
                 "status": res["status"],
                 "error": res["error"],
             }
-            row.update(res["scores"])
+            row.update(res["statistics"])
             summary_rows.append(row)
-            
+
         summary_df = pd.DataFrame(summary_rows)
         summary_path = run_dir / "summary.csv"
         summary_df.to_csv(summary_path, index=False)
-        
-        # Store explicit row-by-row JSON records for deep auditing
+
+        # Store detailed trial records
         details_path = run_dir / "detailed_results.json"
         with open(details_path, "w", encoding="utf-8") as f:
             json.dump(strategy_results, f, indent=2)
-            
-        logger.info(f"Run artifacts successfully generated and secured at: {run_dir}")
+
+        logger.info(f"Run artifacts successfully saved to: {run_dir}")
         return run_dir
