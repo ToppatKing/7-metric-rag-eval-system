@@ -52,7 +52,7 @@ graph TD
     I -.-> L((Evaluation Engine))
     K -.-> L
     D -.-> L
-    M[Ground Truth (Optional)] -.-> L
+    M[Optional Ground Truth] -.-> L
     L --> N[7-Metric Output DataFrame]
     class L,M,N evaluation;
 ```
