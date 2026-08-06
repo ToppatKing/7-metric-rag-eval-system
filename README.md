@@ -146,8 +146,8 @@ The system simulates three distinct retrieval strategies on every query:
 Clone the repository and set up your virtual environment:
 
 ```bash
-git clone [https://github.com/ToppatKing/thesis_rag_eval.git](https://github.com/ToppatKing/thesis_rag_eval.git)
-cd thesis_rag_eval
+git clone [https://github.com/ToppatKing/7-metric-rag-eval-system.git](https://github.com/ToppatKing/7-metric-rag-eval-system.git)
+cd 7-metric-rag-eval-system
 
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -230,5 +230,5 @@ If you use this evaluation framework or codebase for research, academic work, or
   author       = {Jacopo Bandinelli},
   year         = {2026},
   school       = {Universita' degli Studi di Firenze},
-  note         = {GitHub Repository: [https://github.com/ToppatKing/thesis_rag_eval](https://github.com/ToppatKing/thesis_rag_eval)}
+  note         = {GitHub Repository: [https://github.com/ToppatKing/7-metric-rag-eval-system](https://github.com/ToppatKing/7-metric-rag-eval-system)}
 }
