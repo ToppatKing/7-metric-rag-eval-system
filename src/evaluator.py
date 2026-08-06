@@ -24,50 +24,45 @@ class Evaluator:
         question: str, 
         answer: str, 
         contexts: List[str], 
-        latency: float,
-        token_efficiency: float,
-        ground_truth: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Runs evaluation. Skips Recall and ROUGE-L if ground_truth is absent."""
+        ground_truth: str = None,
+        latency: float = 0.0,
+        token_efficiency: float = 0.0
+    ) -> Dict[str, float]:
         
-        # 1. Prepare Base Ragas Dataset
+        has_gt = bool(ground_truth and ground_truth.strip())
+        
+        # Select metrics dynamically based on ground truth availability
+        metrics_to_eval = [faithfulness, answer_relevancy]
+        if has_gt:
+            metrics_to_eval.extend([context_precision, context_recall])
+            
         data = {
             "question": [question],
             "answer": [answer],
             "contexts": [contexts]
         }
-        
-        # 2. Dynamically assign metrics
-        metrics_to_run = [faithfulness, answer_relevancy, context_precision]
-        
-        if ground_truth:
+        if has_gt:
             data["ground_truth"] = [ground_truth]
-            metrics_to_run.append(context_recall)
-
+            
         dataset = Dataset.from_dict(data)
-
-        # 3. Run LLM-as-a-judge metrics
-        ragas_result = evaluate(
-            dataset=dataset,
-            metrics=metrics_to_run,
-            raise_exceptions=False 
-        )
         
-        # 4. Handle Conditional Metrics
-        if ground_truth:
-            rouge_l_score = self.evaluate_rouge_l(answer, ground_truth)
-            c_recall = float(ragas_result.get("context_recall", 0.0))
-        else:
-            rouge_l_score = "N/A"
-            c_recall = "N/A"
+        ragas_result = evaluate(dataset=dataset, metrics=metrics_to_eval, raise_exceptions=False)
         
-        # 5. Compile the final metric dictionary
-        return {
+        results = {
             "Faithfulness": float(ragas_result.get("faithfulness", 0.0)),
             "Answer Relevancy": float(ragas_result.get("answer_relevancy", 0.0)),
-            "Context Precision": float(ragas_result.get("context_precision", 0.0)),
-            "Context Recall": c_recall,
-            "ROUGE-L": rouge_l_score,
             "Latency (s)": latency,
             "Token Efficiency": token_efficiency
         }
+        
+        # Conditionally compute ground-truth dependent metrics
+        if has_gt:
+            results["Context Precision"] = float(ragas_result.get("context_precision", 0.0))
+            results["Context Recall"] = float(ragas_result.get("context_recall", 0.0))
+            results["ROUGE-L"] = self.evaluate_rouge_l(answer, ground_truth)
+        else:
+            results["Context Precision"] = float('nan')
+            results["Context Recall"] = float('nan')
+            results["ROUGE-L"] = float('nan')
+            
+        return results
