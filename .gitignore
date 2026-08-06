@@ -1,0 +1,18 @@
+# Security & Credentials
+.env
+*.pem
+*.key
+
+# Data & Persistence
+chroma_db/
+*.chroma
+outputs/
+results/
+*.csv
+
+# Python & Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
