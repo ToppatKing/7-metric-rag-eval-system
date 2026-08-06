@@ -26,4 +26,4 @@ class RAGConfig:
     
     def __post_init__(self):
         if not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is missing. Please check your model.env file.")
+            raise ValueError("OPENAI_API_KEY is missing. Please check your .env file.")
