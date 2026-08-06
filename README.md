@@ -130,7 +130,7 @@ The system simulates three distinct retrieval strategies on every query:
 
 | Strategy | Algorithmic Mechanism | Primary Use Case | Key Advantages | System Trade-offs |
 | :--- | :--- | :--- | :--- | :--- |
-| **Dense Vector** | Standard Cosine Similarity over dense text embeddings ($e(q) \cdot e(d)$). | Baseline domain search. | • Lowest latency<br/>• Simple vector lookup | • Susceptible to returning redundant chunks<br/>• Struggles when query/document vocabulary differs |
+| **Dense Vector** | Standard Cosine Similarity over dense text embeddings | Baseline domain search. | • Lowest latency<br/>• Simple vector lookup | • Susceptible to returning redundant chunks<br/>• Struggles when query/document vocabulary differs |
 | **MMR** | Maximal Marginal Relevance balancing relevancy with diversity: $\text{ArgMax} [\lambda \text{Sim}_1(d, q) - (1-\lambda) \max \text{Sim}_2(d, d_i)]$. | Broad queries covering multiple sub-topics. | • Eliminates duplicate context<br/>• Maximizes info density per token | • Minimal latency overhead ($K \times 4$ candidate fetch) |
 | **HyDE** | Generates a hypothetical LLM answer first, then uses the hypothetical passage to query the vector index. | Nuanced or zero-shot technical queries. | • Bridges vocabulary gaps<br/>• Significantly improves Context Recall | • Higher latency (requires two sequential LLM calls) |
 
