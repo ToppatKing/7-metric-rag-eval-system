@@ -167,7 +167,7 @@ This ensures that, when handling large datasets (like CUAD), you are not staring
 ```bash
 pip install tqdm
 ```
-Note: This is also due to a self-imposed delay in `src/indexer.py`, originally set at 1 second, to avoid Rate Limit Error 429
+Note: The potentially slow speeds are also due to a self-imposed delay in `src/indexer.py`, originally set at 1 second, to avoid Rate Limit Error 429 when operating with lower-tier subscription models.
 
 ### 3. Interactive Execution
 Run the interactive pipeline:
