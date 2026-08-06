@@ -180,7 +180,7 @@ Follow the CLI prompts:
 
 1. **Document Folder Path:** Enter the local folder containing your domain `.pdf` or `.txt` files (e.g., `./data` or `/Users/name/Documents/Papers`).
 2. **User Question:** Enter your specific domain question.
-3. **Ground Truth Answer:** Enter the gold-standard reference answer used to compute Context Recall and ROUGE-L. This is optional.
+3. **Ground Truth Answer:** Enter the gold-standard reference answer used to compute Context Recall and ROUGE-L (Note: This is optional. You may press Enter to skip this part).
 
 ## A Note on Reference-Free Evaluation Mode
 
