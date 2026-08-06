@@ -69,9 +69,11 @@ def main():
     while not question:
         question = input("Question cannot be empty. Enter your Question:\n> ").strip()
         
-    ground_truth = input("\nEnter Ground Truth Answer (Reference answer for evaluation):\n> ").strip()
-    while not ground_truth:
-        ground_truth = input("Ground Truth cannot be empty. Enter Ground Truth Answer:\n> ").strip()
+    ground_truth = input("\nEnter Ground Truth Answer (Optional - press Enter to skip):\n> ").strip()
+    has_ground_truth = len(ground_truth) > 0
+    if not has_ground_truth:
+        print("⚠️ Notice: Ground Truth omitted. Context Recall, Context Precision, and ROUGE-L will be skipped.")
+
 
     # 3. Initialize Retrieval & Evaluation Components
     retriever = RetrievalEngine(vectorstore, llm, top_k=config.top_k)
