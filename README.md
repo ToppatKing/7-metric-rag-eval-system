@@ -162,7 +162,7 @@ OPENAI_API_KEY=sk-proj-your-actual-api-key-here
 ```
 Install `tqdm` to generate a progress bar.
 
-This ensures that, when handling large datasets (like CUAD), you aren't staring at a blank terminal for an hour wondering if it crashed:
+This ensures that, when handling large datasets (like CUAD), you are not staring at a blank terminal for an hour with no knowledge about a potential crash:
 
 ```bash
 pip install tqdm
