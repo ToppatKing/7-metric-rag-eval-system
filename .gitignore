@@ -5,10 +5,16 @@
 
 # Data & Persistence
 chroma_db/
+chroma_db_cuad/
+chroma_db_museums/
 *.chroma
 outputs/
 results/
 *.csv
+
+# Ignore datasets
+data/
+data_museums/
 
 # Python & Environment
 venv/

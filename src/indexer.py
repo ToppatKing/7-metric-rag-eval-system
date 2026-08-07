@@ -4,6 +4,8 @@ import logging
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import os
+import pandas as pd
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -132,6 +134,53 @@ class Indexer:
             logger.info(f"Purging existing index directory at: {self.persist_directory}")
             shutil.rmtree(self.persist_directory)
         self.persist_directory.mkdir(parents=True, exist_ok=True)
+
+    def load_museum_data(data_dir: str):
+        """Reads CSV or Excel files in data_dir and converts rows into formatted Documents."""
+        documents = []
+        
+        for file in os.listdir(data_dir):
+            file_path = os.path.join(data_dir, file)
+            df = None
+            
+            # Auto-detect file format
+            if file.endswith('.csv'):
+                df = pd.read_csv(file_path)
+            elif file.endswith('.xlsx') or file.endswith('.xls'):
+                df = pd.read_excel(file_path)
+            else:
+                continue  # Skip any non-spreadsheet file
+            
+            # Clean column names (strip whitespace)
+            df.columns = df.columns.str.strip()
+            
+            for idx, row in df.iterrows():
+                # Construct a clean, structured string for each artwork
+                content = (
+                    f"Museo: {row.iloc[0]}\n"
+                    f"Titolo: {row.iloc[1]}\n"
+                    f"Autore: {row.iloc[2]}\n"
+                    f"Datazione: {row.iloc[3]}\n"
+                    f"Tipologia: {row.iloc[4]}\n"
+                    f"Soggetto: {row.iloc[5]}\n"
+                    f"Materiale_Tecnica: {row.iloc[6]}\n"
+                    f"Misure: {row.iloc[7]}\n"
+                    f"Luogo_Convservazione: {row.iloc[8]}\n"
+                    f"Localizzazione: {row.iloc[9]}\n"
+                    f"Indirizzo: {row.iloc[10]}\n"
+                    f"Note_Storico_Critiche: {row.iloc[11]}"
+                )
+               
+                # Attach metadata for precise filtering if needed
+                metadata = {
+                    "source_file": file,
+                    "museo": str(row.iloc[0]),
+                    "titolo": str(row.iloc[1])
+                }
+                
+                documents.append(Document(page_content=content, metadata=metadata))
+                
+        return documents
 
     def _load_document(self, file_path: Path) -> List[Document]:
         """Load document depending on file extension."""
