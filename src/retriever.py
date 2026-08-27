@@ -33,13 +33,20 @@ class RetrievalEngine:
         )
         return retriever.invoke(query)
 
-    def retrieve_hyde(self, query: str) -> List[Document]:
-        """Hypothetical Document Embeddings (HyDE) strategy."""
+def retrieve_hyde(self, query: str) -> List[Document]:
+        """Hypothetical Document Embeddings (HyDE) strategy with Anchoring and Constraints."""
         logger.info("Executing HyDE Retrieval...")
         
-        # Step 1: Instruct the LLM to write a hypothetical response
+        # Step 1: Instruct the LLM to write a constrained hypothetical response
+        # We add CRITICAL INSTRUCTIONS to prevent the "Hallucination Anchor"
         hyde_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert in the given domain. Please write a short, factual passage that answers the user's question. Do not explain your reasoning, just provide the facts."),
+            ("system", """You are a highly skilled domain expert. 
+Write a hypothetical excerpt from a reference document (like a legal contract or a historical museum record) that would perfectly answer the user's question. 
+
+CRITICAL INSTRUCTIONS:
+1. Use standard domain boilerplate, jargon, and terminology.
+2. DO NOT invent specific states, locations, names, dates, notice periods, or quantitative numbers. 
+3. Keep it under 3 sentences."""),
             ("human", "{question}")
         ])
         
@@ -47,13 +54,19 @@ class RetrievalEngine:
         hypothetical_doc = chain.invoke({"question": query})
         logger.debug(f"Hypothetical Document Generated:\n{hypothetical_doc}")
         
-        # Step 2: Use the hypothetical document to query the vector store
+        # Step 2: ANCHOR THE SEARCH
+        # Combine the exact original query with the hypothetical text so the mathematical 
+        # vector retains the user's original intent.
+        anchored_search_query = f"Original Question: {query}\n\nRelevant Excerpt: {hypothetical_doc}"
+        
+        # Step 3: Use the anchored query to search the vector store
         retriever = self.vectorstore.as_retriever(
             search_type="similarity", 
             search_kwargs={"k": self.top_k}
         )
-        # We embed the LLM's hypothetical answer, NOT the user's short question
-        return retriever.invoke(hypothetical_doc)
+        
+        # We embed the anchored query, not just the hallucinated text
+        return retriever.invoke(anchored_search_query)
         
     def retrieve(self, query: str, strategy: str = "dense") -> List[Document]:
         """Routing method for the retrieval strategy."""
