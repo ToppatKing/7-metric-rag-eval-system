@@ -122,6 +122,33 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def compute_mismatch_at_k(retrieved_contexts, true_doc_name, k_values=[1, 2, 3, 5, 10]):
+    """
+    Calculates Document-Level Mismatch (1.0 = missed, 0.0 = found) at different k thresholds.
+    """
+    mismatches = {}
+    
+    # Ensure we don't try to slice beyond what was actually retrieved
+    max_k_available = len(retrieved_contexts)
+    
+    for k in k_values:
+        if k > max_k_available:
+            continue # Skip k-values larger than your top_k setting
+            
+        top_k_chunks = retrieved_contexts[:k]
+        
+        # Safely extract source filenames from LangChain metadata
+        retrieved_files = [
+            chunk.metadata.get("source_file", "") 
+            for chunk in top_k_chunks if hasattr(chunk, 'metadata')
+        ]
+        
+        # If the true document isn't anywhere in the top-k chunks, it's a mismatch
+        is_mismatch = 1.0 if true_doc_name not in retrieved_files else 0.0
+        mismatches[f"mismatch@k={k}"] = is_mismatch
+        
+    return mismatches
+
 def main():
     config = RAGConfig()
     args = parse_args()
@@ -208,20 +235,43 @@ def main():
             ["Either party may terminate upon 30 days written notice of a material breach."],
             ["Yes, Section 4 contains an exclusive distribution rights clause."]
         ]
+        
+        # NEW: The exact filenames containing the correct answers
+        ground_truth_docs = [
+            "contract_delaware_01.pdf", # Replace with actual filename for Q1
+            "termination_clause_42.pdf", # Replace with actual filename for Q2
+            "exclusivity_contract_9.pdf" # Replace with actual filename for Q3
+        ]
 
         strategy_trial_outputs: Dict[str, List[List[Dict[str, Any]]]] = {s: [] for s in strategies}
 
         for trial_idx in range(config.num_trials):
-            logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{config.num_trials} ===")
-            strategy_items = list(strategies.items())
-            random.shuffle(strategy_items)
-
-            for strategy_name, retriever in strategy_items:
-                single_trial_run = []
-                for question in test_questions:
-                    run_output = generator.run_pipeline(retriever, question)
-                    single_trial_run.append(run_output)
-                strategy_trial_outputs[strategy_name].append(single_trial_run)
+                    logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{config.num_trials} ===")
+                    strategy_items = list(strategies.items())
+                    random.shuffle(strategy_items)
+        
+                    for strategy_name, retriever in strategy_items:
+                        single_trial_run = []
+                        
+                        # Zip questions and true document names together
+                        for question, true_doc in zip(test_questions, ground_truth_docs):
+                            run_output = generator.run_pipeline(retriever, question)
+                            
+                            # Compute Mismatch @ K (1, 2, 4, 8, 16, 32, 64)
+                            mismatch_metrics = compute_mismatch_at_k(
+                                retrieved_contexts=run_output.get("contexts", []),
+                                true_doc_name=true_doc,
+                                k_values=[1, 2, 4, 8, 16, 32, 64]
+                            )
+                            
+                            # Attach metrics so they get saved to the JSON report
+                            if "metrics" not in run_output:
+                                run_output["metrics"] = {}
+                            run_output["metrics"].update(mismatch_metrics)
+                            
+                            single_trial_run.append(run_output)
+                            
+                        strategy_trial_outputs[strategy_name].append(single_trial_run)
 
         final_strategy_results = []
         for strategy_name in strategies:
