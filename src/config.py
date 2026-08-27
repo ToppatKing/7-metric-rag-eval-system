@@ -24,7 +24,7 @@ class RAGConfig:
     chunk_overlap: int = 200
     
     # Execution Parameters
-    top_k: int = 4
+    top_k: int = 64
     num_trials: int = 3
     
     def __post_init__(self):
