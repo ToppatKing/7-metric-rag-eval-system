@@ -4,6 +4,9 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import time
+import tiktoken
+from rouge_score import rouge_scorer
 
 import numpy as np
 import pandas as pd
@@ -19,6 +22,20 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_serializer(obj: Any) -> Any:
+    """Serializes LangChain Document objects, Paths, and numpy types for json.dump."""
+    if hasattr(obj, "page_content"):
+        return {
+            "page_content": obj.page_content,
+            "metadata": getattr(obj, "metadata", {})
+        }
+    if hasattr(obj, "item"):  # Handles numpy scalars like np.float64, np.int64
+        return obj.item()
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
 
 
 class Evaluator:
@@ -44,6 +61,51 @@ class Evaluator:
             context_recall,
         ]
 
+    def compute_operational_and_lexical_metrics(
+        self,
+        query: str, 
+        retrieved_contexts: list, 
+        generated_answer: str, 
+        ground_truth_answer: str, 
+        start_time: float,
+        model_name: str = "gpt-4o-mini"
+    ) -> dict:
+        """
+        Computes Latency, Token Efficiency, and ROUGE-L F1 score 
+        for a single RAG execution cycle.
+        """
+        # 1. Latency Calculation
+        end_time = time.time()
+        latency_seconds = end_time - start_time
+
+        # 2. Token Efficiency Calculation using tiktoken
+        try:
+            encoding = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        context_text = "\n".join([
+            doc.page_content if hasattr(doc, "page_content") else str(doc)
+            for doc in retrieved_contexts
+        ])
+        context_tokens = len(encoding.encode(context_text))
+        answer_tokens = len(encoding.encode(generated_answer))
+        
+        token_efficiency = (answer_tokens / context_tokens) if context_tokens > 0 else 0.0
+
+        # 3. ROUGE-L F1 Score Calculation
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        rouge_scores = scorer.score(ground_truth_answer, generated_answer)
+        rouge_l_f1 = rouge_scores['rougeL'].fmeasure
+
+        return {
+            "latency_s": round(latency_seconds, 2),
+            "context_tokens": context_tokens,
+            "answer_tokens": answer_tokens,
+            "token_efficiency": round(token_efficiency, 4),
+            "rouge_l_f1": round(rouge_l_f1, 4)
+        }
+
     def _validate_scores(self, result_dict: Dict[str, Any]) -> Tuple[bool, str]:
         """Validate that required scores are finite and not zeroed by errors."""
         for metric in self.metrics:
@@ -61,11 +123,12 @@ class Evaluator:
         self,
         strategy_name: str,
         trial_outputs: List[List[Dict[str, Any]]],
-        ground_truths: List[List[str]],
+        ground_truths: List[str],
+        ground_truth_docs: List[str] = None,
     ) -> Dict[str, Any]:
         """
-        P2 Fix: Evaluates a strategy across N trials and calculates statistical metrics
-        (median, standard deviation, and p95 latency).
+        Evaluates a strategy across N trials and calculates statistical metrics
+        including ROUGE-L, Token Efficiency, and Document-Level Mismatch@K.
         """
         logger.info(f"Evaluating {len(trial_outputs)} trial(s) for strategy: {strategy_name}")
         
@@ -73,6 +136,9 @@ class Evaluator:
         trial_latencies: List[float] = []
         trial_costs: List[float] = []
         trial_compressions: List[float] = []
+        trial_rouge_l: List[float] = []
+        trial_token_eff: List[float] = []
+        trial_mismatches: Dict[str, List[float]] = {}
 
         raw_trial_records = []
         overall_status = "SUCCESS"
@@ -83,20 +149,36 @@ class Evaluator:
             answers = [item["answer"] for item in single_trial_run]
             contexts = [item["contexts"] for item in single_trial_run]
             
-            # Aggregate token & timing stats for this trial
-            trial_total_latency = sum(item["metrics"]["total_latency_sec"] for item in single_trial_run)
-            trial_total_cost = sum(item["metrics"]["estimated_cost_usd"] for item in single_trial_run)
-            avg_compression = np.mean([item["metrics"]["context_to_answer_compression_ratio"] for item in single_trial_run])
+            # Aggregate trial-level timing and cost
+            trial_total_latency = sum(
+                item["metrics"].get("total_latency_sec", item["metrics"].get("latency_s", 0)) 
+                for item in single_trial_run
+            )
+            trial_total_cost = sum(item["metrics"].get("estimated_cost_usd", 0) for item in single_trial_run)
+            avg_compression = np.mean([item["metrics"].get("context_to_answer_compression_ratio", 0) for item in single_trial_run])
 
             trial_latencies.append(trial_total_latency)
             trial_costs.append(trial_total_cost)
             trial_compressions.append(avg_compression)
 
+            # Collect ROUGE-L, Token Efficiency, and Mismatch@K
+            for item in single_trial_run:
+                m = item.get("metrics", {})
+                if "rouge_l_f1" in m:
+                    trial_rouge_l.append(m["rouge_l_f1"])
+                if "token_efficiency" in m:
+                    trial_token_eff.append(m["token_efficiency"])
+                for key, val in m.items():
+                    if key.startswith("mismatch@k="):
+                        if key not in trial_mismatches:
+                            trial_mismatches[key] = []
+                        trial_mismatches[key].append(val)
+
             dataset = Dataset.from_dict({
                 "question": questions,
                 "answer": answers,
                 "contexts": contexts,
-                "ground_truths": ground_truths,
+                "ground_truth": ground_truths,
             })
 
             try:
@@ -137,11 +219,19 @@ class Evaluator:
                 stats_summary[f"{metric_name}_median"] = None
                 stats_summary[f"{metric_name}_std"] = None
 
-        # Calculate timing/efficiency statistics
-        stats_summary["latency_p95_sec"] = round(float(np.percentile(trial_latencies, 95)), 4) if trial_latencies else None
-        stats_summary["latency_median_sec"] = round(float(np.median(trial_latencies)), 4) if trial_latencies else None
+        # Timing, Cost, Lexical & Efficiency medians
+        stats_summary["latency_median_sec"] = round(float(np.median(trial_latencies)), 2) if trial_latencies else None
+        stats_summary["rouge_l_f1_median"] = round(float(np.median(trial_rouge_l)), 4) if trial_rouge_l else None
+        stats_summary["token_efficiency_median"] = round(float(np.median(trial_token_eff)), 4) if trial_token_eff else None
         stats_summary["avg_compression_ratio"] = round(float(np.mean(trial_compressions)), 4) if trial_compressions else None
         stats_summary["avg_cost_usd"] = round(float(np.mean(trial_costs)), 6) if trial_costs else None
+
+        # Mismatch @ K medians
+        for k_label, m_values in trial_mismatches.items():
+            if m_values:
+                stats_summary[f"{k_label}_median"] = round(float(np.mean(m_values)), 4)
+            else:
+                stats_summary[f"{k_label}_median"] = None
 
         return {
             "strategy_name": strategy_name,
@@ -171,7 +261,7 @@ class Evaluator:
                 "run_identifier": run_identifier,
                 "timestamp": timestamp,
                 "config": experiment_config,
-            }, f, indent=2)
+            }, f, indent=2, default=_safe_serializer)
 
         # Store statistical summary CSV
         summary_rows = []
@@ -188,10 +278,10 @@ class Evaluator:
         summary_path = run_dir / "summary.csv"
         summary_df.to_csv(summary_path, index=False)
 
-        # Store detailed trial records
+        # Store detailed trial records safely using the custom serializer
         details_path = run_dir / "detailed_results.json"
         with open(details_path, "w", encoding="utf-8") as f:
-            json.dump(strategy_results, f, indent=2)
+            json.dump(strategy_results, f, indent=2, default=_safe_serializer)
 
         logger.info(f"Run artifacts successfully saved to: {run_dir}")
         return run_dir
