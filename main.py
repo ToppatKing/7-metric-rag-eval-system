@@ -4,12 +4,16 @@ import shutil
 import argparse
 import logging
 import random
+import time
+import tiktoken
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any
 
+
 # Silence ChromaDB telemetry warnings
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
@@ -21,6 +25,7 @@ from src.evaluator import Evaluator
 from src.generator import RAGGenerator
 from src.retriever import RetrievalEngine
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,14 +33,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RAGEvaluatorMain")
 
+
 class StrategyRetrieverWrapper:
-    """Adapts RetrievalEngine to LangChain's .invoke() interface for the generator."""
-    def __init__(self, engine: RetrievalEngine, strategy_name: str):
+    """
+    Decoupled Retriever Wrapper:
+    Fetches deep retrieval pool (k=64) for Mismatch@K evaluation,
+    while passing only top-k (e.g., 5) to the LLM and RAGAS evaluator.
+    """
+    def __init__(self, engine: RetrievalEngine, strategy_name: str, generation_top_k: int = 5):
         self.engine = engine
         self.strategy_name = strategy_name
+        self.generation_top_k = generation_top_k
+        self.last_retrieved_contexts: List[Any] = []
 
     def invoke(self, query: str):
-        return self.engine.retrieve(query, strategy=self.strategy_name)
+        # 1. Fetch full candidate pool (64 chunks) from engine
+        all_docs = self.engine.retrieve(query, strategy=self.strategy_name)
+        self.last_retrieved_contexts = all_docs
+        
+        # 2. Slice only top-k for generation and RAGAS evaluation
+        return all_docs[:self.generation_top_k]
+
 
 def initialize_models(config: RAGConfig):
     """Initialize LLM and Embedding instances using RAGConfig."""
@@ -49,8 +67,8 @@ def initialize_models(config: RAGConfig):
         embeddings = AzureOpenAIEmbeddings(
             azure_deployment=config.embedding_model,
             api_version=config.azure_api_version,
-            chunk_size=16,       # Sends 16 chunks per API request
-            max_retries=20,      # Retries automatically if temporary rate limits occur
+            chunk_size=100,
+            max_retries=20,
         )
         return llm, embeddings, f"azure:{config.llm_model}", f"azure:{config.embedding_model}"
     elif config.openai_api_key:
@@ -61,6 +79,7 @@ def initialize_models(config: RAGConfig):
     else:
         logger.error("No valid API credentials found.")
         sys.exit(1)
+
 
 def load_museum_csv_data(data_dir: str) -> List[Document]:
     """Reads all CSV files in data_dir and converts spreadsheet rows into formatted Documents."""
@@ -109,6 +128,7 @@ def load_museum_csv_data(data_dir: str) -> List[Document]:
     logger.info(f"Loaded {len(documents)} artwork records from CSV files.")
     return documents
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Multi-Dataset RAG Evaluation System")
     parser.add_argument("--dataset", type=str, choices=["cuad", "museums"], default="cuad", help="Select dataset to evaluate.")
@@ -122,38 +142,10 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def compute_mismatch_at_k(retrieved_contexts, true_doc_name, k_values=[1, 2, 3, 5, 10]):
-    """
-    Calculates Document-Level Mismatch (1.0 = missed, 0.0 = found) at different k thresholds.
-    """
-    mismatches = {}
-    
-    # Ensure we don't try to slice beyond what was actually retrieved
-    max_k_available = len(retrieved_contexts)
-    
-    for k in k_values:
-        if k > max_k_available:
-            continue # Skip k-values larger than your top_k setting
-            
-        top_k_chunks = retrieved_contexts[:k]
-        
-        # Safely extract source filenames from LangChain metadata
-        retrieved_files = [
-            chunk.metadata.get("source_file", "") 
-            for chunk in top_k_chunks if hasattr(chunk, 'metadata')
-        ]
-        
-        # If the true document isn't anywhere in the top-k chunks, it's a mismatch
-        is_mismatch = 1.0 if true_doc_name not in retrieved_files else 0.0
-        mismatches[f"mismatch@k={k}"] = is_mismatch
-        
-    return mismatches
-
 def main():
     config = RAGConfig()
     args = parse_args()
     
-    # Set default paths based on selected dataset
     if args.dataset == "cuad":
         corpus_dir = args.corpus_dir or "data"
         persist_dir = args.persist_dir or "chroma_db_cuad"
@@ -163,7 +155,6 @@ def main():
 
     logger.info(f"Starting RAG System [{args.dataset.upper()} Dataset | {args.mode.upper()} Mode]...")
 
-    # Initialize Azure Models
     llm, embeddings, model_name, embedding_name = initialize_models(config)
 
     # 1. Build or Load Index
@@ -183,7 +174,9 @@ def main():
         )
         vectorstore = indexer.build_or_load_index(
             corpus_directory=corpus_path,
-            force_reindex=args.force_reindex
+            llm=llm,
+            force_reindex=args.force_reindex,
+            use_summary_chunking=(args.dataset == "museums")
         )
         total_docs = len(discovered_files)
     else:
@@ -212,12 +205,15 @@ def main():
             )
         total_docs = len(raw_docs)
 
-    # 2. Setup Retrieval Engine and Strategies
-    retrieval_engine = RetrievalEngine(vectorstore=vectorstore, llm=llm, top_k=config.top_k)
+    # 2. Setup Retrieval Engine with Deep Retrieval (top_k=64 for Mismatch@K)
+    retrieval_engine = RetrievalEngine(vectorstore=vectorstore, llm=llm, top_k=64)
+    
+    # Decouple: pass generation_top_k (e.g., 5) to the wrapper for LLM generation/RAGAS
+    generation_k = 5
     strategies = {
-        "Dense_Similarity": StrategyRetrieverWrapper(retrieval_engine, "dense"),
-        "MMR_Search": StrategyRetrieverWrapper(retrieval_engine, "mmr"),
-        "HyDE_Search": StrategyRetrieverWrapper(retrieval_engine, "hyde"),
+        "Dense_Similarity": StrategyRetrieverWrapper(retrieval_engine, "dense", generation_top_k=generation_k),
+        "MMR_Search": StrategyRetrieverWrapper(retrieval_engine, "mmr", generation_top_k=generation_k),
+        "HyDE_Search": StrategyRetrieverWrapper(retrieval_engine, "hyde", generation_top_k=generation_k),
     }
     generator = RAGGenerator(llm=llm, model_name=model_name)
 
@@ -226,52 +222,140 @@ def main():
         evaluator = Evaluator(llm=llm, embeddings=embeddings, output_dir=args.results_dir)
 
         test_questions = [
-            "What is the governing law specified in the agreement?",
-            "What are the termination rights and notice periods for breach?",
-            "Does the agreement contain an exclusivity or non-compete clause?"
-        ]
-        ground_truths = [
-            ["The agreement is governed by the laws of the State of Delaware."],
-            ["Either party may terminate upon 30 days written notice of a material breach."],
-            ["Yes, Section 4 contains an exclusive distribution rights clause."]
+            "What is the governing law specified in the Innoviva Collaboration Agreement?",
+            "What are the termination rights and notice periods for breach in the Innoviva contract?",
+            "Does the Zogenix Distributor Agreement contain an exclusivity or non-compete clause?",
+            "How is 'Confidential Information' defined in the Innoviva agreement?",
+            "What is the initial term of the Zogenix agreement?",
+            "Is there a provision for automatic renewal in the Innoviva Collaboration Agreement?",
+            "What happens to intellectual property developed during the Innoviva collaboration?",
+            "Are there any indemnification obligations for third-party claims in the Zogenix contract?",
+            "What is the cap on aggregate liability for Innoviva?",
+            "Which party bears the risk of loss during product shipment in the Zogenix agreement?",
+            "Are there specific payment terms or invoice deadlines for Zogenix?",
+            "Is consent required before assigning the Innoviva contract to a third party?",
+            "Does the Zogenix contract include a severability clause?",
+            "What constitutes a Force Majeure event in the Innoviva Collaboration Agreement?",
+            "What is the dispute resolution or arbitration mechanism for Zogenix?",
+            "Are there any audit rights granted to the parties in the Innoviva contract?",
+            "Do confidentiality obligations survive the termination of the Zogenix agreement?",
+            "What are the insurance requirements for the contractor in the Innoviva agreement?",
+            "Is there a non-solicitation clause regarding employees in the Zogenix contract?",
+            "How are changes of control or acquisitions handled by Innoviva?",
+            "What are the warranty provisions for delivered products in the Zogenix Distributor Agreement?",
+            "Who owns the pre-existing background intellectual property in the Innoviva collaboration?",
+            "What is the required procedure for amending the Zogenix agreement?",
+            "Where should official legal notices be sent according to the Innoviva contract?",
+            "Does the Zogenix agreement state that the parties are independent contractors?"
         ]
         
-        # NEW: The exact filenames containing the correct answers
-        ground_truth_docs = [
-            "contract_delaware_01.pdf", # Replace with actual filename for Q1
-            "termination_clause_42.pdf", # Replace with actual filename for Q2
-            "exclusivity_contract_9.pdf" # Replace with actual filename for Q3
+        ground_truths = [
+            "The agreement is governed by the laws of the State of Delaware.",
+            "Either party may terminate upon 30 days written notice of a material breach.",
+            "Yes, Section 4 contains an exclusive distribution rights clause.",
+            "Confidential Information includes any non-public business, financial, or technical data marked as confidential.",
+            "The initial term is typically set for three to five years from the Effective Date.",
+            "Yes, the agreement automatically renews for successive one-year periods unless written notice is given.",
+            "Intellectual property jointly developed shall be jointly owned, while pre-existing IP remains with the original owner.",
+            "The Supplier agrees to indemnify and hold harmless the Buyer against any third-party IP infringement claims.",
+            "Liability is generally capped at the total fees paid by the Customer in the twelve months preceding the claim.",
+            "Risk of loss passes to the Buyer upon delivery to the common carrier.",
+            "Invoices are due and payable net 30 to 45 days from the date of receipt.",
+            "Neither party may assign this Agreement without the prior written consent of the other party.",
+            "If any provision is held invalid, the remaining provisions shall continue in full force and effect.",
+            "Force Majeure includes Acts of God, natural disasters, war, terrorism, and labor strikes.",
+            "Disputes shall be resolved by binding arbitration under standard commercial rules.",
+            "A party may audit the other's records upon 15 to 30 days prior written notice.",
+            "Confidentiality obligations survive for a period of three to five years after contract termination.",
+            "Commercial General Liability insurance must be maintained with specified limits per occurrence.",
+            "The parties agree not to solicit each other's employees for a period of 12 months.",
+            "Upon a Change of Control, the other party generally retains the right to terminate the agreement.",
+            "The Seller warrants the goods will be free from defects in material and workmanship for a stated period.",
+            "Each party retains exclusive ownership of its pre-existing Background IP.",
+            "The agreement may only be amended by a written instrument signed by authorized representatives of both parties.",
+            "Notices must be sent via certified mail or recognized overnight courier to the addresses listed in the signature block.",
+            "Yes, the agreement explicitly states that it does not create a partnership, agency, or employer-employee relationship."
         ]
 
+        ground_truth_docs = [
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt",
+            "INNOVIVA_INC_08_07_2014-EX-10.1-COLLABORATION_AGREEMENT.txt",
+            "ZogenixInc_20190509_10-Q_EX-10.2_11663313_EX-10.2_Distributor_Agreement.txt"
+        ]
+        
         strategy_trial_outputs: Dict[str, List[List[Dict[str, Any]]]] = {s: [] for s in strategies}
+        k_values = [1, 2, 4, 8, 16, 32, 64]
 
         for trial_idx in range(config.num_trials):
-                    logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{config.num_trials} ===")
-                    strategy_items = list(strategies.items())
-                    random.shuffle(strategy_items)
-        
-                    for strategy_name, retriever in strategy_items:
-                        single_trial_run = []
-                        
-                        # Zip questions and true document names together
-                        for question, true_doc in zip(test_questions, ground_truth_docs):
-                            run_output = generator.run_pipeline(retriever, question)
-                            
-                            # Compute Mismatch @ K (1, 2, 4, 8, 16, 32, 64)
-                            mismatch_metrics = compute_mismatch_at_k(
-                                retrieved_contexts=run_output.get("contexts", []),
-                                true_doc_name=true_doc,
-                                k_values=[1, 2, 4, 8, 16, 32, 64]
-                            )
-                            
-                            # Attach metrics so they get saved to the JSON report
-                            if "metrics" not in run_output:
-                                run_output["metrics"] = {}
-                            run_output["metrics"].update(mismatch_metrics)
-                            
-                            single_trial_run.append(run_output)
-                            
-                        strategy_trial_outputs[strategy_name].append(single_trial_run)
+            logger.info(f"=== Starting Trial Execution {trial_idx + 1}/{config.num_trials} ===")
+            strategy_items = list(strategies.items())
+            random.shuffle(strategy_items)
+
+            for strategy_name, retriever in strategy_items:
+                single_trial_run = []
+                for question, gt_answer, gt_doc in zip(test_questions, ground_truths, ground_truth_docs):
+                    t_start = time.time()
+                    
+                    # 1. Execute generation (receives top 5 chunks via wrapper)
+                    run_output = generator.run_pipeline(retriever, question)
+                    
+                    # 2. Grab full 64 candidate chunks from wrapper
+                    deep_candidate_pool = retriever.last_retrieved_contexts
+                    
+                    # 3. Extract filename strings from metadata (JSON-safe, no raw Document objects)
+                    candidate_doc_names = [
+                        Path(str(d.metadata.get("source_file") or d.metadata.get("source") or "")).name
+                        for d in deep_candidate_pool
+                    ]
+                    
+                    # 4. Calculate Document Mismatch across all k thresholds
+                    target_doc_name = Path(gt_doc).name.strip()
+                    mismatch_metrics = {}
+                    for k in k_values:
+                        top_k_names = candidate_doc_names[:k]
+                        found = any(target_doc_name == name or target_doc_name in name for name in top_k_names)
+                        mismatch_metrics[f"mismatch@k={k}"] = 0.0 if found else 1.0
+                    
+                    # 5. Compute operational & lexical metrics on top-5 contexts
+                    op_lex_metrics = evaluator.compute_operational_and_lexical_metrics(
+                        query=question,
+                        retrieved_contexts=run_output.get("contexts", []),
+                        generated_answer=run_output.get("answer", ""),
+                        ground_truth_answer=gt_answer,
+                        start_time=t_start,
+                        model_name=config.llm_model
+                    )
+                    
+                    if "metrics" not in run_output:
+                        run_output["metrics"] = {}
+                    run_output["metrics"].update(mismatch_metrics)
+                    run_output["metrics"].update(op_lex_metrics)
+                    
+                    single_trial_run.append(run_output)
+                    
+                strategy_trial_outputs[strategy_name].append(single_trial_run)
 
         final_strategy_results = []
         for strategy_name in strategies:
@@ -279,7 +363,8 @@ def main():
             eval_summary = evaluator.evaluate_multi_trial_strategy(
                 strategy_name=strategy_name,
                 trial_outputs=trial_data,
-                ground_truths=ground_truths
+                ground_truths=ground_truths,
+                ground_truth_docs=ground_truth_docs # <--- Pass this to calculate Mismatch@K
             )
             final_strategy_results.append(eval_summary)
 
@@ -288,7 +373,8 @@ def main():
             "embedding_model": embedding_name,
             "chunk_size": config.chunk_size,
             "chunk_overlap": config.chunk_overlap,
-            "top_k": config.top_k,
+            "retrieval_depth_k": 64,
+            "generation_context_k": generation_k,
             "num_trials": config.num_trials,
             "total_documents": total_docs,
         }
